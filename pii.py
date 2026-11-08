@@ -1,8 +1,4 @@
 import re
-import spacy
-
-# Загрузка легковесной предобученной модели русского языка
-nlp = spacy.load("ru_core_news_sm")
 
 FORBIDDEN_KEYWORDS = [
     r"паспорт\s+гражданина",
@@ -14,6 +10,7 @@ FORBIDDEN_KEYWORDS = [
     r"врачебная\s+тайна"
 ]
 
+
 def contains_forbidden_docs(text: str) -> bool:
     """Проверка FR-04: запрет на паспорта и медсправки."""
     lower_text = text.lower()
@@ -22,21 +19,21 @@ def contains_forbidden_docs(text: str) -> bool:
             return True
     return False
 
+
 def mask_pii(text: str) -> str:
-    """Маскирование ПДн (FR-03): spaCy (ФИО) + Regex (контакты и документы)."""
-    # 1. Номера, почта, документы
+    """Маскирование ПДн (FR-03): скрытие контактов, документов и ФИО."""
+    # 1. Почта, телефоны, документы
     text = re.sub(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "[EMAIL]", text)
     text = re.sub(r"(?:\+7|8)[\s\-\(]*\d{3}[\s\-\)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}", "[ТЕЛЕФОН]", text)
     text = re.sub(r"\b\d{4}\s+\d{6}\b", "[ПАСПОРТ]", text)
     text = re.sub(r"\b\d{3}-\d{3}-\d{3}\s+\d{2}\b", "[СНИЛС]", text)
     text = re.sub(r"\b\d{10}\b|\b\d{12}\b", "[ИНН]", text)
 
-    # 2. Поиск и скрытие ФИО через библиотеку spaCy (тег PER = Person)
-    doc = nlp(text)
-    spans = [(ent.start_char, ent.end_char) for ent in doc.ents if ent.label_ == "PER"]
+    # 2. ФИО (поиск конструкций: Иванов И.И. или Иванов Иван Иванович)
+    fio_initials = r"\b[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.)\b"
+    fio_full = r"\b[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2}\b"
 
-    # Замена с конца строки, чтобы не сбивались координаты символов
-    for start, end in sorted(spans, key=lambda x: x[0], reverse=True):
-        text = text[:start] + "[ФИО]" + text[end:]
+    text = re.sub(fio_initials, "[ФИО]", text)
+    text = re.sub(fio_full, "[ФИО]", text)
 
     return text
