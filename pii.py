@@ -1,17 +1,8 @@
 import re
-from natasha import (
-    Segmenter, MorphVocab, NewsEmbedding,
-    NewsMorphTagger, NewsSyntaxParser, NewsNERTagger,
-    NamesExtractor, Doc
-)
+import spacy
 
-segmenter = Segmenter()
-morph_vocab = MorphVocab()
-emb = NewsEmbedding()
-morph_tagger = NewsMorphTagger(emb)
-syntax_parser = NewsSyntaxParser(emb)
-ner_tagger = NewsNERTagger(emb)
-names_extractor = NamesExtractor(morph_vocab)
+# Загрузка легковесной предобученной модели русского языка
+nlp = spacy.load("ru_core_news_sm")
 
 FORBIDDEN_KEYWORDS = [
     r"паспорт\s+гражданина",
@@ -24,7 +15,7 @@ FORBIDDEN_KEYWORDS = [
 ]
 
 def contains_forbidden_docs(text: str) -> bool:
-    """Проверка FR-04: запрет на обработку паспортов и медицинских документов."""
+    """Проверка FR-04: запрет на паспорта и медсправки."""
     lower_text = text.lower()
     for pattern in FORBIDDEN_KEYWORDS:
         if re.search(pattern, lower_text):
@@ -32,31 +23,20 @@ def contains_forbidden_docs(text: str) -> bool:
     return False
 
 def mask_pii(text: str) -> str:
-    """Маскирование ПДн (FR-03): Regex + Natasha (ФИО, почты, телефоны, СНИЛС, ИНН)."""
-    # Электронная почта
+    """Маскирование ПДн (FR-03): spaCy (ФИО) + Regex (контакты и документы)."""
+    # 1. Номера, почта, документы
     text = re.sub(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "[EMAIL]", text)
-    # Номера телефонов
     text = re.sub(r"(?:\+7|8)[\s\-\(]*\d{3}[\s\-\)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}", "[ТЕЛЕФОН]", text)
-    # Серия и номер паспорта
     text = re.sub(r"\b\d{4}\s+\d{6}\b", "[ПАСПОРТ]", text)
-    # СНИЛС
     text = re.sub(r"\b\d{3}-\d{3}-\d{3}\s+\d{2}\b", "[СНИЛС]", text)
-    # ИНН
     text = re.sub(r"\b\d{10}\b|\b\d{12}\b", "[ИНН]", text)
 
-    # Поиск и скрытие ФИО через Natasha
-    doc = Doc(text)
-    doc.segment(segmenter)
-    doc.tag_morph(morph_tagger)
-    doc.tag_ner(ner_tagger)
+    # 2. Поиск и скрытие ФИО через библиотеку spaCy (тег PER = Person)
+    doc = nlp(text)
+    spans = [(ent.start_char, ent.end_char) for ent in doc.ents if ent.label_ == "PER"]
 
-    spans_to_replace = []
-    for span in doc.spans:
-        if span.type == "PER":
-            spans_to_replace.append((span.start, span.stop))
-
-    # Замена с конца строки для сохранения смещений символов
-    for start, stop in sorted(spans_to_replace, key=lambda x: x[0], reverse=True):
-        text = text[:start] + "[ФИО]" + text[stop:]
+    # Замена с конца строки, чтобы не сбивались координаты символов
+    for start, end in sorted(spans, key=lambda x: x[0], reverse=True):
+        text = text[:start] + "[ФИО]" + text[end:]
 
     return text
