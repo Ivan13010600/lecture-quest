@@ -1,172 +1,272 @@
+import os
 import streamlit as st
-import time
+from datetime import datetime
+import requests
+from dotenv import load_dotenv
 
-# ==========================================
-# 1. НАСТРОЙКА СТРАНИЦЫ И СТИЛЕЙ (CSS)
-# ==========================================
-st.set_page_config(
-    page_title="Lecture Quest — Генератор вопросов",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="collapsed"  # Удобно для мобильных
-)
+from ocr import read_uploaded_file
+from pii import contains_forbidden_docs, mask_pii
+from llm import generate_validated_quiz, get_api_key
 
-# Стили: Тёмная тема + Адаптивность под смартфоны
+load_dotenv()
+
+# Базовая конфигурация страницы
+st.set_page_config(page_title="Lecture Quest", page_icon="🎓", layout="wide")
+
+# Фирменный стиль интерфейса
 st.markdown("""
-    <style>
-    .stApp { background-color: #0E1117; color: #FFFFFF; }
-    section[data-testid="stSidebar"] { background-color: #161B22; }
-
-    /* Оранжевые кнопки */
+<style>
+    .stApp {
+        background-color: #0E1117;
+        color: #FAFAFA;
+    }
+    .main-header {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #FFFFFF;
+        margin-bottom: 0.5rem;
+    }
+    .sub-header {
+        font-size: 1rem;
+        color: #A0AABF;
+        margin-bottom: 2rem;
+    }
+    .card {
+        background-color: #161B26;
+        padding: 24px;
+        border-radius: 12px;
+        border: 1px solid #262C3D;
+        margin-bottom: 20px;
+    }
+    .quote-box {
+        background-color: #1A2234;
+        border-left: 4px solid #FF5500;
+        padding: 12px 16px;
+        border-radius: 4px;
+        font-size: 0.95rem;
+        color: #D1D5DB;
+        margin-top: 10px;
+    }
     div.stButton > button:first-child {
         background-color: #FF5500;
         color: white;
         border: none;
         border-radius: 8px;
-        padding: 0.5rem 1rem;
-        font-weight: bold;
+        padding: 12px 24px;
+        font-weight: 600;
         width: 100%;
+        transition: background-color 0.2s;
     }
-    div.stButton > button:first-child:hover { background-color: #FF7733; color: white; }
-
-    /* Карточки шагов */
-    .info-step {
-        background-color: #161B22;
-        border-radius: 8px;
-        padding: 10px 15px;
-        margin-bottom: 8px;
-        border-left: 4px solid #FF5500;
+    div.stButton > button:first-child:hover {
+        background-color: #FF7733;
+        color: white;
     }
-
-    /* Адаптивность для мобильных */
-    @media (max-width: 768px) {
-        .stApp { padding: 5px; }
+    .disclaimer {
+        font-size: 0.8rem;
+        color: #6B7280;
+        text-align: center;
+        margin-top: 40px;
     }
-    </style>
+</style>
 """, unsafe_allow_html=True)
 
-# Инициализация состояний
-if 'generated' not in st.session_state:
-    st.session_state.generated = False
-if 'score' not in st.session_state:
-    st.session_state.score = 0
-if 'answered' not in st.session_state:
-    st.session_state.answered = {}
+# Инициализация переменных сессии
+if "quiz_data" not in st.session_state:
+    st.session_state.quiz_data = None
+if "quiz_submitted" not in st.session_state:
+    st.session_state.quiz_submitted = False
+if "user_answers" not in st.session_state:
+    st.session_state.user_answers = {}
 
-# ==========================================
-# 2. БОКОВАЯ ПАНЕЛЬ (SIDEBAR)
-# ==========================================
+
+def log_complaint(question_id: int, question_text: str, reason: str):
+    """Логирование замечаний к вопросам в журнал complaints.log (FR-12)."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] Вопрос #{question_id}: '{question_text}' | Причина: {reason}\n"
+
+    with open("complaints.log", "a", encoding="utf-8") as f:
+        f.write(log_line)
+
+    tg_token = os.getenv("TG_BOT_TOKEN") or (st.secrets.get("TG_BOT_TOKEN") if hasattr(st, "secrets") else None)
+    tg_chat = os.getenv("TG_CHAT_ID") or (st.secrets.get("TG_CHAT_ID") if hasattr(st, "secrets") else None)
+    if tg_token and tg_chat:
+        try:
+            tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+            requests.post(tg_url, json={"chat_id": tg_chat, "text": f"⚠️ Замечание к вопросу:\n{log_line}"}, timeout=5)
+        except Exception:
+            pass
+
+
+# Боковая панель
 with st.sidebar:
-    st.markdown("<h2 style='color: #FF5500;'>LQ LECTURE QUEST</h2>", unsafe_allow_html=True)
-    st.caption("Твои лекции — наши вопросы")
-    st.divider()
+    st.markdown("### 🎓 Lecture Quest")
+    st.caption("ИИ-генератор вопросов по учебным материалам")
+    st.markdown("---")
 
-    st.radio("Навигация", ["🏠 Главная", "📁 Мои лекции", "🕒 История", "⚙️ Настройки"], label_visibility="collapsed")
-    st.divider()
+    q_count = st.slider("Количество вопросов:", min_value=10, max_value=20, value=10, step=1)
 
-    # Требование ТЗ: Ограничение/Предупреждение об ИИ
-    st.warning("⚠️ **Внимание:** Вопросы генерируются ИИ (DeepSeek API). Проверяйте точность ответов.")
-    st.info("👤 Студент: Шибаев И.Н. (ИВТб-2301)")
-
-# ==========================================
-# 3. ОСНОВНАЯ ОБЛАСТЬ (MAIN CONTENT)
-# ==========================================
-
-st.title("⚡ ГЕНЕРАТОР ВОПРОСОВ ПО ФОТО ЛЕКЦИИ")
-st.write("Загрузи фото с лекции, и ИИ автоматически сгенерирует тест для самопроверки.")
-
-# Двухколоночный макет
-col_left, col_right = st.columns([1, 1], gap="large")
-
-# ------------------------------------------
-# ЛЕВАЯ КОЛОНКА: Загрузка
-# ------------------------------------------
-with col_left:
-    st.subheader("1. Загрузка лекции")
-    uploaded_file = st.file_uploader(
-        "Выберите или перетащите фото лекции",
-        type=["jpg", "png", "jpeg", "heic"],
-        help="Максимальный размер: 10 МБ"
+    st.markdown("---")
+    st.markdown("#### 🔒 Безопасность и правила")
+    st.markdown("""
+    - Форматы: **PDF, DOCX, TXT, PNG, JPG**
+    - Размер файла: **до 10 МБ**
+    - Объём текста: **от 500 до 18 000 символов**
+    - Паспорта и справки **запрещены**
+    - ФИО и контакты **маскируются**
+    """)
+    st.markdown("---")
+    st.markdown(
+        "<div class='disclaimer'>Проект ВятГУ<br>Кафедра ЭВМ, Шибаев И.Н.<br>2026</div>",
+        unsafe_allow_html=True
     )
 
-    if uploaded_file is not None:
-        st.success(f"Файл `{uploaded_file.name}` загружен!")
-        st.image(uploaded_file, caption="Предпросмотр лекции", use_container_width=True)
-    else:
-        st.info("📌 Загрузите четкое фото рукописного или печатного конспекта.")
+# Главный экран
+st.markdown("<div class='main-header'>Генератор вопросов для подготовки</div>", unsafe_allow_html=True)
+st.markdown(
+    "<div class='sub-header'>Загрузите конспект, методичку или фото страниц для создания теста для самопроверки</div>",
+    unsafe_allow_html=True)
 
-    st.subheader("2. Алгоритм работы")
-    st.markdown("""
-        <div class="info-step"><b>1. OCR-сканирование:</b> Распознавание текста (OpenCV + Tesseract)</div>
-        <div class="info-step"><b>2. Анализ ИИ:</b> Выделение ключевых смыслов (DeepSeek API)</div>
-        <div class="info-step"><b>3. Тестирование:</b> Генерация 10–20 вопросов с ответами</div>
-    """, unsafe_allow_html=True)
+# 1. Загрузка файла
+if st.session_state.quiz_data is None:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
 
-    st.write("")
-    if st.button("⚡ Сгенерировать вопросы"):
-        if uploaded_file is None:
-            st.error("Сначала загрузите фото лекции!")
+    uploaded_file = st.file_uploader(
+        "Выберите файл документа или фотографию конспекта",
+        type=["pdf", "docx", "txt", "png", "jpg", "jpeg"]
+    )
+
+    consent = st.checkbox("Я подтверждаю согласие на учебную обработку материалов (FR-05)")
+
+    generate_btn = st.button("Сгенерировать тест")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if generate_btn:
+        if not uploaded_file:
+            st.error("Пожалуйста, прикрепите файл перед началом генерации.")
+        elif not consent:
+            st.error("Для генерации необходимо дать согласие на обработку материала.")
+        elif uploaded_file.size > 10 * 1024 * 1024:
+            st.error("Размер файла превышает лимит 10 МБ.")
         else:
-            with st.spinner('Анализ изображения и генерация вопросов (< 30 сек)...'):
-                time.sleep(2.0)  # Имитация работы алгоритма по ТЗ
-                st.session_state.generated = True
-                st.session_state.score = 0
-                st.session_state.answered = {}
-                st.toast("Вопросы успешно сгенерированы!", icon="🎉")
+            with st.spinner("1/3 Извлечение и оптическое распознавание текста..."):
+                try:
+                    file_bytes = uploaded_file.read()
+                    raw_text = read_uploaded_file(uploaded_file.name, file_bytes)
+                except Exception as e:
+                    st.error(f"Ошибка при чтении файла: {e}")
+                    st.stop()
 
-# ------------------------------------------
-# ПРАВАЯ КОЛОНКА: Вопросы (Демо-данные по ТЗ)
-# ------------------------------------------
-with col_right:
-    st.subheader("Сгенерированный тест 📋")
+            char_count = len(raw_text)
+            if char_count < 500:
+                st.error(f"Извлечено слишком мало текста ({char_count} симв.). Минимальный объём — 500 символов.")
+                st.stop()
+            if char_count > 18000:
+                st.error(f"Файл слишком велик ({char_count} симв.). Допустимый лимит — 18 000 символов (~10-12 стр.).")
+                st.stop()
 
-    dummy_questions = [
-        {
-            "id": 1,
-            "q": "Что описывает Второй закон Ньютона?",
-            "options": ["А) Зависимость ускорения от силы и массы", "В) Закон сохранения энергии", "С) Притяжение тел"],
-            "correct": "А) Зависимость ускорения от силы и массы"
-        },
-        {
-            "id": 2,
-            "q": "В каких единицах измеряется сила в системе СИ?",
-            "options": ["А) Джоуль", "В) Ньютон", "С) Паскаль"],
-            "correct": "В) Ньютон"
-        },
-        {
-            "id": 3,
-            "q": "Как изменится кинетическая энергия при увеличении скорости в 2 раза?",
-            "options": ["А) Увеличится в 2 раза", "В) Увеличится в 4 раза", "С) Не изменится"],
-            "correct": "В) Увеличится в 4 раза"
-        }
-    ]
+            with st.spinner("2/3 Проверка на конфиденциальность и маскирование ПДн..."):
+                if contains_forbidden_docs(raw_text):
+                    st.error("Загрузка отменена: обнаружены признаки паспорта или медицинских документов (FR-04).")
+                    st.stop()
+                safe_text = mask_pii(raw_text)
 
-    if st.session_state.generated:
-        st.caption(f"Сгенерировано вопросов: **{len(dummy_questions)}**")
+            with st.spinner("3/3 DeepSeek AI формирует вопросы и сопоставляет цитаты..."):
+                try:
+                    questions = generate_validated_quiz(safe_text, target_count=q_count)
+                    if len(questions) < 5:
+                        st.error(
+                            "Не удалось сформировать достаточное количество вопросов с подтверждёнными цитатами. Попробуйте другой фрагмент текста.")
+                        st.stop()
 
-        for idx, q in enumerate(dummy_questions):
-            with st.expander(f"Вопрос {q['id']}: {q['q']}", expanded=(idx == 0)):
-                user_choice = st.radio("Варианты ответа:", q['options'], key=f"q_{q['id']}")
+                    st.session_state.quiz_data = questions
+                    st.session_state.quiz_submitted = False
+                    st.session_state.user_answers = {}
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Ошибка генерации теста: {e}")
 
-                col_btn1, col_btn2 = st.columns(2)
-                with col_btn1:
-                    if st.button(f"Ответить #{q['id']}", key=f"check_{q['id']}"):
-                        if user_choice == q['correct']:
-                            st.success("Верно! 🎉")
-                            st.session_state.answered[q['id']] = True
-                        else:
-                            st.error(f"Неверно. Правильно: {q['correct']}")
-                            st.session_state.answered[q['id']] = False
+# 2. Прохождение теста
+else:
+    questions = st.session_state.quiz_data
 
-                # Требование ТЗ (FR-007): Кнопка «Пожаловаться»
-                with col_btn2:
-                    if st.button(f"🚨 Ошибка в вопросе", key=f"rep_{q['id']}"):
-                        st.toast(f"Жалоба на вопрос #{q['id']} отправлена!", icon="📩")
+    if not st.session_state.quiz_submitted:
+        st.info(f"Сформировано вопросов: {len(questions)}. Ответьте на вопросы и нажмите «Завершить тест».")
 
-        # Требование ТЗ (FR-006): Расчет итогового результата
-        if len(st.session_state.answered) == len(dummy_questions):
-            correct_cnt = sum(1 for v in st.session_state.answered.values() if v)
-            st.divider()
-            st.subheader(f"📊 Итоговый результат: {correct_cnt} / {len(dummy_questions)}")
+        with st.form("quiz_form"):
+            for q in questions:
+                st.markdown(f"**Вопрос {q['id']}:** {q['question']}")
+                chosen = st.radio(
+                    f"Варианты к вопросу {q['id']}:",
+                    options=q["options"],
+                    key=f"q_{q['id']}",
+                    label_visibility="collapsed"
+                )
+                st.session_state.user_answers[q["id"]] = chosen
+                st.markdown("---")
+
+            submit_test = st.form_submit_button("Завершить тест и проверить результат")
+            if submit_test:
+                st.session_state.quiz_submitted = True
+                st.rerun()
+
+    # 3. Результаты теста и разбор ошибок
     else:
-        st.info("👈 Загрузите фото лекции слева и нажмите **«Сгенерировать вопросы»**.")
+        score = 0
+        mistakes = []
+
+        for q in questions:
+            user_ans = st.session_state.user_answers.get(q["id"])
+            if user_ans == q["correct_answer"]:
+                score += 1
+            else:
+                mistakes.append(q)
+
+        total = len(questions)
+        pct = int((score / total) * 100)
+
+        st.markdown(f"""
+        <div class='card' style='text-align: center;'>
+            <h2>Ваш результат: {score} из {total} ({pct}%)</h2>
+            <p>{'Отличный результат! Материал усвоен превосходно.' if pct >= 80 else 'Рекомендуется повторить отмеченные ниже темы.'}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if mistakes:
+            st.markdown("### 🔍 Подробный разбор допущенных ошибок:")
+            for m in mistakes:
+                with st.expander(f"Вопрос #{m['id']}: {m['question']}", expanded=True):
+                    st.write(f"❌ **Ваш ответ:** {st.session_state.user_answers.get(m['id'])}")
+                    st.write(f"✅ **Правильный ответ:** {m['correct_answer']}")
+
+                    st.markdown("**Подтверждающая цитата из первоисточника:**")
+                    st.markdown(f"<div class='quote-box'>«{m['quote']}»</div>", unsafe_allow_html=True)
+
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        reason = st.text_input(f"Нашли неточность в вопросе #{m['id']}?",
+                                               key=f"complaint_text_{m['id']}")
+                    with col2:
+                        st.write("")
+                        st.write("")
+                        if st.button("Пожаловаться", key=f"btn_comp_{m['id']}"):
+                            if reason.strip():
+                                log_complaint(m["id"], m["question"], reason.strip())
+                                st.success("Жалоба записана в журнал аудита!")
+                            else:
+                                st.warning("Укажите причину.")
+        else:
+            st.balloons()
+            st.success("Идеально! Ни одной ошибки!")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 Пройти тест по новому материалу"):
+            st.session_state.quiz_data = None
+            st.session_state.quiz_submitted = False
+            st.session_state.user_answers = {}
+            st.rerun()
+
+# Предупреждение об ИИ (FR-11, CON-03)
+st.markdown(
+    "<div class='disclaimer'>⚠️ Внимание: вопросы и цитаты сгенерированы искусственным интеллектом DeepSeek и могут содержать неточности. Всегда сверяйтесь с официальными учебниками.</div>",
+    unsafe_allow_html=True
+)
